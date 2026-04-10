@@ -4,28 +4,45 @@ namespace ClipSidekick;
 
 internal sealed class AppSettings
 {
-    private static readonly string SettingsDir = Path.Combine(
+    internal static readonly string SettingsDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ClipSidekick");
     private static readonly string SettingsFile = Path.Combine(SettingsDir, "settings.json");
+    internal static readonly string McpJsonFile = Path.Combine(SettingsDir, "mcp.json");
 
     public string Hotkey { get; set; } = "Win+Shift+V";
     public int NotificationDurationMs { get; set; } = 1000;
     public int MaxHistoryItems { get; set; } = 50;
+    public bool ShowNotification { get; set; } = true;
     public int EditTaskIndex { get; set; }
     public int EditToneIndex { get; set; }
     public int EditFormatIndex { get; set; }
     public int EditLengthIndex { get; set; }
     public int EditChoices { get; set; } = 1;
     public string Model { get; set; } = "";
+    public string[] QuickTaskHotkeys { get; set; } = ["", "", "", "", "", "", "", "", "", ""];
+    public List<CustomTask> CustomTasks { get; set; } = [];
+    public string FreeformHotkey { get; set; } = "";
+    public string BubbleHotkey { get; set; } = "";
+    public bool McpEnabled { get; set; }
+    public List<string> DisabledMcpServers { get; set; } = [];
+    public bool SkillsEnabled { get; set; }
+
+    internal static readonly string SkillsDir = Path.Combine(SettingsDir, "skills");
+    public string SystemMessage { get; set; } = "You are a helpful assistant called Sidekick that provides succinct and accurate responses. Respond ONLY with the generated text. No explanations, no markdown fences, no preamble.";
 
     public string HotkeyDisplay => Hotkey;
 
     public (uint mods, uint vk) ParseHotkey()
     {
+        return ParseHotkeyString(Hotkey);
+    }
+
+    public static (uint mods, uint vk) ParseHotkeyString(string hotkey)
+    {
         uint mods = NativeMethods.MOD_NOREPEAT;
         uint vk = 0;
 
-        var parts = Hotkey.Split('+');
+        var parts = hotkey.Split('+');
         foreach (var part in parts)
         {
             switch (part)
@@ -107,4 +124,11 @@ internal sealed class AppSettings
         }
         catch { }
     }
+}
+
+internal sealed class CustomTask
+{
+    public string Name { get; set; } = "";
+    public string Prompt { get; set; } = "";
+    public string Hotkey { get; set; } = "";
 }

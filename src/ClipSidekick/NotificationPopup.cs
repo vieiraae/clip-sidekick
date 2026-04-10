@@ -2,6 +2,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace ClipSidekick;
 
@@ -37,16 +38,30 @@ internal sealed class NotificationPopup
     private bool _processing;
     private float _animPhase;
 
+    // Freeform input mode
+    private bool _inputMode;
+    private string _inputText = "";
+    private IntPtr _keyboardHook;
+    private NativeMethods.LowLevelKeyboardProc _keyboardHookProc = null!;
+    private IntPtr _savedKeyboardLayout;
+
     public int DurationMs { get; set; } = 1000;
 
     public event Action? Clicked;
     public event Action? AIEditClicked;
     public event Action<int>? QuickTaskClicked;
     public event Action? CancelRequested;
+    public event Action<string>? FreeformSubmitted;
+
+    public string[] TaskHotkeys { get; set; } = new string[10];
+    public List<CustomTask> CustomTasks { get; set; } = [];
+    public string FreeformHotkey { get; set; } = "";
+
+    private int TotalTaskCount => TaskLabels.Length + CustomTasks.Count + 1; // +1 for freeform
 
     // Task labels (must match MainWindow.EditTasks, skip index 0)
     private static readonly string[] TaskLabels = ["Proofread", "Rewrite", "Use synonyms", "Minor revise", "Major revise", "Describe", "Answer", "Explain", "Expand", "Summarize"];
-    private static readonly string[] TaskIcons = ["👁", "✏️", "📚", "🔧", "🔨", "📝", "💬", "💡", "🌟", "📋"];
+    private static readonly string[] TaskIcons = ["\ud83d\udc41", "\u270f\ufe0f", "\ud83d\udcda", "\ud83d\udd27", "\ud83d\udd28", "\ud83d\udcdd", "\ud83d\udcac", "\ud83d\udca1", "\ud83c\udf1f", "\ud83d\udccb"];
 
     // Colors
     private static readonly Color BgColor = Color.FromArgb(30, 30, 30);
@@ -146,8 +161,16 @@ internal sealed class NotificationPopup
         _dropdownOpen = false;
         _dropdownHoverIndex = -1;
         _processing = false;
+        if (_inputMode)
+            ExitInputMode();
         NativeMethods.ShowWindow(_hWnd, NativeMethods.SW_HIDE);
         ResizePopup(ScaledWidth, ScaledHeight);
+    }
+
+    public void UpdatePreviewText(string text)
+    {
+        _previewText = TruncateText(text, 45);
+        NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
     }
 
     public void StartProcessing()
@@ -160,13 +183,250 @@ internal sealed class NotificationPopup
         ResizePopup(ScaledWidth, ScaledHeight);
         NativeMethods.SetTimer(_hWnd, ANIM_TIMER_ID, 30, IntPtr.Zero);
         NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
+        InstallKeyboardHook();
     }
 
     public void StopProcessing()
     {
         _processing = false;
         NativeMethods.KillTimer(_hWnd, ANIM_TIMER_ID);
+        RemoveKeyboardHook();
         Dismiss();
+    }
+
+    /// <summary>
+    /// Shows the notification in freeform input mode (used by the global hotkey path).
+    /// </summary>
+    public void ShowInputMode()
+    {
+        // Position near cursor (same as Show)
+        NativeMethods.GetCursorPos(out var cursor);
+        var monitor = NativeMethods.MonitorFromPoint(cursor, NativeMethods.MONITOR_DEFAULTTONEAREST);
+        var mi = new NativeMethods.MONITORINFO { cbSize = Marshal.SizeOf<NativeMethods.MONITORINFO>() };
+        NativeMethods.GetMonitorInfoW(monitor, ref mi);
+
+        if (NativeMethods.GetDpiForMonitor(monitor, NativeMethods.MDT_EFFECTIVE_DPI, out uint dpiX, out _) == 0)
+            _dpiScale = dpiX / 96f;
+        else
+            _dpiScale = 1f;
+
+        int pw = ScaledWidth;
+        int ph = ScaledHeight;
+
+        var workArea = mi.rcWork;
+        int x = cursor.X - pw / 2;
+        int y = cursor.Y - ph - 12;
+
+        if (y < workArea.Top)
+            y = cursor.Y + 20;
+
+        x = Math.Clamp(x, workArea.Left + 4, workArea.Right - pw - 4);
+        y = Math.Clamp(y, workArea.Top + 4, workArea.Bottom - ph - 4);
+
+        NativeMethods.SetWindowPos(_hWnd, NativeMethods.HWND_TOPMOST, x, y, pw, ph,
+            NativeMethods.SWP_NOACTIVATE);
+
+        CaptureKeyboardLayout();
+        _inputMode = true;
+        _inputText = "";
+        _dropdownOpen = false;
+        _dropdownHoverIndex = -1;
+        _processing = false;
+        _hovered = false;
+
+        NativeMethods.KillTimer(_hWnd, TIMER_ID);
+        NativeMethods.ShowWindow(_hWnd, NativeMethods.SW_SHOWNOACTIVATE);
+        NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
+        InstallKeyboardHook();
+    }
+
+    public void EnterInputMode()
+    {
+        CaptureKeyboardLayout();
+        _inputMode = true;
+        _inputText = "";
+        _dropdownOpen = false;
+        _dropdownHoverIndex = -1;
+        NativeMethods.KillTimer(_hWnd, TIMER_ID);
+        ResizePopup(ScaledWidth, ScaledHeight);
+        NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
+        InstallKeyboardHook();
+    }
+
+    private void CaptureKeyboardLayout()
+    {
+        var fgWnd = NativeMethods.GetForegroundWindow();
+        uint tid = NativeMethods.GetWindowThreadProcessId(fgWnd, out _);
+        _savedKeyboardLayout = NativeMethods.GetKeyboardLayout(tid);
+    }
+
+    private void ExitInputMode()
+    {
+        _inputMode = false;
+        _inputText = "";
+        RemoveKeyboardHook();
+    }
+
+    private void InstallKeyboardHook()
+    {
+        RemoveKeyboardHook();
+        _keyboardHookProc = KeyboardHookCallback;
+        _keyboardHook = NativeMethods.SetWindowsHookExW(
+            NativeMethods.WH_KEYBOARD_LL, _keyboardHookProc, _hInstance, 0);
+    }
+
+    private void RemoveKeyboardHook()
+    {
+        if (_keyboardHook != IntPtr.Zero)
+        {
+            NativeMethods.UnhookWindowsHookEx(_keyboardHook);
+            _keyboardHook = IntPtr.Zero;
+        }
+    }
+
+    private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && _processing && !_inputMode)
+        {
+            int wmMsg = wParam.ToInt32();
+            if (wmMsg == NativeMethods.WM_KEYDOWN || wmMsg == 0x0104)
+            {
+                var hookStruct = Marshal.PtrToStructure<NativeMethods.KBDLLHOOKSTRUCT>(lParam);
+                if (hookStruct.vkCode == 0x1B) // VK_ESCAPE
+                {
+                    CancelRequested?.Invoke();
+                    return new IntPtr(1);
+                }
+            }
+            return NativeMethods.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+        }
+
+        if (nCode >= 0 && _inputMode)
+        {
+            int wmMsg = wParam.ToInt32();
+            var hookStruct = Marshal.PtrToStructure<NativeMethods.KBDLLHOOKSTRUCT>(lParam);
+            uint vk = hookStruct.vkCode;
+
+            // Let modifier keys pass through so the OS tracks key state correctly
+            if (vk is 0xA0 or 0xA1 or 0xA2 or 0xA3 or 0xA4 or 0xA5 // L/R Shift, Ctrl, Alt
+                     or 0x10 or 0x11 or 0x12  // VK_SHIFT, VK_CONTROL, VK_MENU
+                     or 0x14 or 0x90 or 0x91  // CapsLock, NumLock, ScrollLock
+                     or 0x5B or 0x5C)         // Win keys
+                return NativeMethods.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+
+            // Only handle key-down events for the rest
+            if (wmMsg != NativeMethods.WM_KEYDOWN && wmMsg != 0x0104) // WM_KEYDOWN or WM_SYSKEYDOWN
+                return new IntPtr(1);
+
+            if (vk == 0x1B) // VK_ESCAPE
+            {
+                ExitInputMode();
+                Dismiss();
+                return new IntPtr(1);
+            }
+
+            if (vk == 0x0D) // VK_RETURN
+            {
+                if (_inputText.Length > 0)
+                {
+                    var instruction = _inputText;
+                    ExitInputMode();
+                    StartProcessing();
+                    FreeformSubmitted?.Invoke(instruction);
+                }
+                else
+                {
+                    ExitInputMode();
+                    Dismiss();
+                }
+                return new IntPtr(1);
+            }
+
+            if (vk == 0x08) // VK_BACK
+            {
+                if (_inputText.Length > 0)
+                {
+                    _inputText = _inputText[..^1];
+                    NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
+                }
+                return new IntPtr(1);
+            }
+
+            // Ctrl+V — paste from clipboard
+            if (vk == 0x56 && NativeMethods.KBDLLHOOKSTRUCT_IsCtrl(hookStruct))
+            {
+                PasteFromClipboard();
+                return new IntPtr(1);
+            }
+
+            // Ctrl+A — swallow
+            if (vk == 0x41 && NativeMethods.KBDLLHOOKSTRUCT_IsCtrl(hookStruct))
+                return new IntPtr(1);
+
+            // Convert keypress to character
+            // Build key state from physical keyboard (GetKeyboardState is per-thread and stale here)
+            byte[] keyState = new byte[256];
+            foreach (int mk in new[] { 0x10, 0xA0, 0xA1,   // VK_SHIFT, VK_LSHIFT, VK_RSHIFT
+                                        0x11, 0xA2, 0xA3,   // VK_CONTROL, VK_LCONTROL, VK_RCONTROL
+                                        0x12, 0xA4, 0xA5 }) // VK_MENU, VK_LMENU, VK_RMENU
+            {
+                if ((NativeMethods.GetAsyncKeyState(mk) & 0x8000) != 0)
+                    keyState[mk] = 0x80;
+            }
+            // Toggle keys: low bit of GetAsyncKeyState = toggled on
+            if ((NativeMethods.GetAsyncKeyState(0x14) & 1) != 0) keyState[0x14] = 1; // CapsLock
+            if ((NativeMethods.GetAsyncKeyState(0x90) & 1) != 0) keyState[0x90] = 1; // NumLock
+
+            var sb = new StringBuilder(4);
+            var fgWnd = NativeMethods.GetForegroundWindow();
+            uint tid = NativeMethods.GetWindowThreadProcessId(fgWnd, out _);
+            IntPtr layout = NativeMethods.GetKeyboardLayout(tid);
+            if (layout == IntPtr.Zero) layout = _savedKeyboardLayout;
+            int result = NativeMethods.ToUnicodeEx(vk, hookStruct.scanCode, keyState, sb, sb.Capacity, 0, layout);
+            if (result > 0 && _inputText.Length < 200)
+            {
+                string chars = sb.ToString(0, result);
+                if (chars.Length > 0 && chars[0] >= 32)
+                {
+                    _inputText += chars;
+                    NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
+                }
+            }
+
+            return new IntPtr(1); // swallow non-modifier keystrokes
+        }
+
+        return NativeMethods.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+    }
+
+    private void PasteFromClipboard()
+    {
+        try
+        {
+            if (NativeMethods.OpenClipboard(IntPtr.Zero))
+            {
+                try
+                {
+                    var hData = NativeMethods.GetClipboardData(13); // CF_UNICODETEXT
+                    if (hData != IntPtr.Zero)
+                    {
+                        var ptr = NativeMethods.GlobalLock(hData);
+                        if (ptr != IntPtr.Zero)
+                        {
+                            var clipText = Marshal.PtrToStringUni(ptr) ?? "";
+                            NativeMethods.GlobalUnlock(hData);
+                            if (_inputText.Length + clipText.Length <= 200)
+                                _inputText += clipText;
+                            else
+                                _inputText += clipText[..(200 - _inputText.Length)];
+                            NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
+                        }
+                    }
+                }
+                finally { NativeMethods.CloseClipboard(); }
+            }
+        }
+        catch { }
     }
 
     private void ResizePopup(int w, int h)
@@ -201,14 +461,31 @@ internal sealed class NotificationPopup
                 int clickX = NativeMethods.GET_X_LPARAM(lParam);
                 int clickY = NativeMethods.GET_Y_LPARAM(lParam);
 
+                // In input mode, ignore clicks
+                if (_inputMode)
+                    return IntPtr.Zero;
+
                 if (_dropdownOpen)
                 {
                     // Check if clicking on a dropdown item
                     if (_dropdownHoverIndex >= 0)
                     {
-                        int taskIdx = _dropdownHoverIndex + 1; // +1 because EditTasks[0] is "<unset>"
-                        StartProcessing();
-                        QuickTaskClicked?.Invoke(taskIdx);
+                        if (_dropdownHoverIndex == 0)
+                        {
+                            // Ask AI... (freeform input)
+                            EnterInputMode();
+                        }
+                        else
+                        {
+                            // Index 1-10 → built-in tasks (EditTasks 1-10)
+                            // Index 11+ → custom tasks (EditTasks 11+)
+                            int di = _dropdownHoverIndex - 1; // offset past freeform
+                            int taskIdx = di < TaskLabels.Length
+                                ? di + 1
+                                : 11 + (di - TaskLabels.Length);
+                            StartProcessing();
+                            QuickTaskClicked?.Invoke(taskIdx);
+                        }
                     }
                     else
                     {
@@ -238,7 +515,7 @@ internal sealed class NotificationPopup
                 {
                     // Open dropdown
                     _dropdownOpen = true;
-                    int dropH = TaskLabels.Length * 26 + 16;
+                    int dropH = TotalTaskCount * 26 + 16;
                     ResizePopup(ScaledWidth, ScaledHeight + dropH);
                     NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
                     return IntPtr.Zero;
@@ -282,7 +559,7 @@ internal sealed class NotificationPopup
                     if (moveY >= dropY + 8 && moveX >= 4 && moveX < ScaledWidth - 4)
                     {
                         int idx = (moveY - dropY - 8) / dropItemH;
-                        if (idx >= 0 && idx < TaskLabels.Length)
+                        if (idx >= 0 && idx < TotalTaskCount)
                             newDropIdx = idx;
                     }
                     if (newDropIdx != _dropdownHoverIndex)
@@ -314,8 +591,8 @@ internal sealed class NotificationPopup
                     _dropdownHoverIndex = -1;
                     ResizePopup(ScaledWidth, ScaledHeight);
                 }
-                // Resume auto-dismiss (unless processing)
-                if (!_processing)
+                // Resume auto-dismiss (unless processing or in input mode)
+                if (!_processing && !_inputMode)
                     NativeMethods.SetTimer(_hWnd, TIMER_ID, (uint)DurationMs, IntPtr.Zero);
                 NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
                 return IntPtr.Zero;
@@ -408,6 +685,39 @@ internal sealed class NotificationPopup
         // Preview text - centered (leave space for AI button + arrow)
         using var textFont = new Font("Segoe UI", 9f);
         using var textBrush = new SolidBrush(TextColor);
+
+        if (_inputMode)
+        {
+            // Input mode: show ✨ icon + typed text or placeholder
+            using var inputIconFont = new Font("Segoe UI Emoji", 8f);
+            using var inputIconBrush = new SolidBrush(Color.FromArgb(220, 200, 100));
+            var iconSize = g.MeasureString("\u2728", inputIconFont);
+            float textH = g.MeasureString("Wg", textFont).Height;
+            float centerY = (ScaledHeight - textH) / 2f;
+            g.DrawString("\u2728", inputIconFont, inputIconBrush, 8, (ScaledHeight - iconSize.Height) / 2f);
+
+            var inputRect = new RectangleF(36, centerY, w - 44, textH + 2);
+            if (_inputText.Length == 0)
+            {
+                using var phBrush = new SolidBrush(Color.FromArgb(120, 120, 120));
+                g.DrawString("Type an instruction...", textFont, phBrush, inputRect);
+            }
+            else
+            {
+                // Show text with cursor
+                var displayText = _inputText + "\u2502"; // thin pipe cursor
+                // Scroll: measure full text, if wider than rect, shift left
+                var fullSize = g.MeasureString(displayText, textFont);
+                float offsetX = 0;
+                if (fullSize.Width > inputRect.Width)
+                    offsetX = inputRect.Width - fullSize.Width;
+                g.SetClip(inputRect);
+                g.DrawString(displayText, textFont, textBrush, inputRect.X + offsetX, inputRect.Y);
+                g.ResetClip();
+            }
+        }
+        else
+        {
         var textSize = g.MeasureString(_previewText, textFont);
         var textRect = new RectangleF(12, (ScaledHeight - textSize.Height) / 2f, w - 64, textSize.Height + 2);
         using var fmt = new StringFormat
@@ -417,8 +727,11 @@ internal sealed class NotificationPopup
             Alignment = StringAlignment.Center
         };
         g.DrawString(_previewText, textFont, textBrush, textRect, fmt);
+        }
 
-        // AI edit button (stars) or Cancel button during processing
+        // AI edit button (stars) or Cancel button during processing (hidden in input mode)
+        if (!_inputMode)
+        {
         int aiBtnX = w - 52;
         int aiBtnY = (ScaledHeight - 24) / 2;
         if (_processing)
@@ -469,6 +782,7 @@ internal sealed class NotificationPopup
                 arrowX + (14 - arrowSize.Width) / 2,
                 arrowY + (24 - arrowSize.Height) / 2);
         }
+        } // end !_inputMode
 
         // Dropdown list
         if (_dropdownOpen)
@@ -487,9 +801,14 @@ internal sealed class NotificationPopup
             using var emojiFont = new Font("Segoe UI Emoji", 8.5f);
             using var dimBrush = new SolidBrush(Color.FromArgb(160, 160, 160));
 
-            for (int i = 0; i < TaskLabels.Length; i++)
+            for (int i = 0; i < TotalTaskCount; i++)
             {
                 int iy = dropY + 8 + i * dropItemH;
+
+                // Separator after freeform entry
+                if (i == 1)
+                    g.DrawLine(sepPen, 12, iy, w - 12, iy);
+
                 if (_dropdownHoverIndex == i)
                 {
                     using var hlBrush = new SolidBrush(Color.FromArgb(55, 55, 55));
@@ -497,9 +816,34 @@ internal sealed class NotificationPopup
                     using var hlPath = CreateRoundedRect(hlRect, 4);
                     g.FillPath(hlBrush, hlPath);
                 }
-                var iconSz = g.MeasureString(TaskIcons[i], emojiFont);
-                g.DrawString(TaskIcons[i], emojiFont, textBrush, 12, iy + (dropItemH - iconSz.Height) / 2);
-                g.DrawString(TaskLabels[i], taskFont, _dropdownHoverIndex == i ? textBrush : dimBrush, 12 + iconSz.Width + 2, iy + 5);
+
+                string icon, label, hk;
+                if (i == 0)
+                {
+                    icon = "\u2728";
+                    label = "Ask AI...";
+                    hk = FreeformHotkey;
+                }
+                else if (i <= TaskLabels.Length)
+                {
+                    int ti = i - 1;
+                    icon = TaskIcons[ti];
+                    label = TaskLabels[ti];
+                    hk = (TaskHotkeys != null && ti < TaskHotkeys.Length) ? TaskHotkeys[ti] : "";
+                }
+                else
+                {
+                    int ci = i - 1 - TaskLabels.Length;
+                    icon = "\u26a1";
+                    label = CustomTasks[ci].Name;
+                    hk = CustomTasks[ci].Hotkey;
+                }
+
+                var iconSz = g.MeasureString(icon, emojiFont);
+                g.DrawString(icon, emojiFont, textBrush, 12, iy + (dropItemH - iconSz.Height) / 2);
+
+                var displayText = string.IsNullOrEmpty(hk) ? label : $"{label}  ({hk})";
+                g.DrawString(displayText, taskFont, _dropdownHoverIndex == i ? textBrush : dimBrush, 12 + iconSz.Width + 2, iy + 5);
             }
         }
 

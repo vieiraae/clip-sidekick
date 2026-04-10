@@ -2,6 +2,7 @@
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using GitHub.Copilot.SDK;
 
 namespace ClipSidekick;
@@ -23,6 +24,7 @@ internal sealed class MainWindow
     private const int SCROLLBAR_WIDTH = 6;
     private const int SCROLLBAR_MIN_THUMB = 20;
     private const int HOTKEY_ID = 1;
+    private const int HOTKEY_TASK_BASE = 100; // task hotkeys: 100 + taskIndex (0-9)
     private const nuint PASTE_TIMER_ID = 100;
 
     private IntPtr _hWnd;
@@ -68,6 +70,7 @@ internal sealed class MainWindow
     private int _editModelIndex;   // index into _editModels
     private bool _editModelDropdownOpen;
     private Rectangle _editModelDropdownRect; // stored during drawing
+    private int _editModelScrollOffset; // scroll offset in pixels for edit tab model dropdown
     private bool _editChoicesDragging;
     private Rectangle _editChoicesSliderRect; // stored during drawing
     private int _editHoverElement = -1; // which edit UI element is hovered
@@ -87,8 +90,10 @@ internal sealed class MainWindow
     private Rectangle _pillTaskRect, _pillToneRect, _pillFormatRect, _pillLengthRect;
     private bool _editLengthDropdownOpen;
 
-    private static readonly string[] EditTasks = ["<unset>", "Proofread", "Rewrite", "Use synonyms", "Minor revise", "Major revise", "Describe", "Answer", "Explain", "Expand", "Summarize"];
-    private static readonly string[] EditTaskIcons = ["", "\u270f\ufe0f", "\ud83d\udc41", "\ud83d\udcda", "\ud83d\udd27", "\ud83d\udd28", "\ud83d\udcdd", "\ud83d\udcac", "\ud83d\udca1", "\ud83c\udf1f", "\ud83d\udccb"];
+    private static readonly string[] BuiltInEditTasks = ["<unset>", "Proofread", "Rewrite", "Use synonyms", "Minor revise", "Major revise", "Describe", "Answer", "Explain", "Expand", "Summarize"];
+    private static readonly string[] BuiltInEditTaskIcons = ["", "\u270f\ufe0f", "\ud83d\udc41", "\ud83d\udcda", "\ud83d\udd27", "\ud83d\udd28", "\ud83d\udcdd", "\ud83d\udcac", "\ud83d\udca1", "\ud83c\udf1f", "\ud83d\udccb"];
+    private string[] EditTasks = BuiltInEditTasks;
+    private string[] EditTaskIcons = BuiltInEditTaskIcons;
     private static readonly string[] EditTones = ["<unset>", "Professional", "Casual", "Enthusiastic", "Informational", "Confident", "Technical", "Funny"];
     private static readonly string[] EditToneIcons = ["", "\ud83d\udcbc", "\ud83d\ude0a", "\ud83e\udd29", "\u2139\ufe0f", "\ud83e\udd19", "\u2699\ufe0f", "\ud83e\udd20"];
     private static readonly string[] EditFormats = ["<unset>", "Single paragraph", "Paragraphs with line breaks", "List", "Ordered list", "Table", "Task list", "Headings", "Blockquotes", "Code blocks", "Emojis", "HTML", "JSON"];
@@ -112,6 +117,12 @@ internal sealed class MainWindow
     private float _aiAnimPhase; // 0..1 animation phase for edge glow
     private const nuint ANIM_TIMER_ID = 200;
     private const nuint TRAY_ANIM_TIMER_ID = 300;
+    private const nuint COPY_TIMER_ID = 400;
+    private int _pendingHotkeyTaskIndex = -1;
+    private bool _pendingFreeformHotkey;
+    private bool _pendingBubbleHotkey;
+    private string? _pendingFreeformText;
+    private uint _clipboardSeqBeforeCopy;
     private Icon?[] _trayAnimFrames = [];
     private int _trayAnimFrame;
 
@@ -123,6 +134,10 @@ internal sealed class MainWindow
     private int _bubbleTaskDropdownItemIndex = -1;
     private int _bubbleTaskHoverIndex = -1; // hover index within task dropdown
     private bool _inlineAiFromNotification; // true when triggered from notification popup
+
+    // Freeform overlay
+    private const int HOTKEY_FREEFORM = 200;
+    private const int HOTKEY_BUBBLE = 300;
 
     // Colors - modern dark theme
     private static readonly Color BgColor = Color.FromArgb(32, 32, 32);
@@ -154,6 +169,7 @@ internal sealed class MainWindow
         _monitor.ClipboardChanged += OnClipboardChanged;
         _settings = AppSettings.Load();
         _monitor.MaxItems = _settings.MaxHistoryItems;
+        RebuildTaskArrays();
 
         // Restore edit dropdown settings
         _editTaskIndex = Math.Clamp(_settings.EditTaskIndex, 0, EditTasks.Length - 1);
@@ -218,6 +234,9 @@ internal sealed class MainWindow
         // Create notification popup
         _notification = new NotificationPopup();
         _notification.DurationMs = _settings.NotificationDurationMs;
+        _notification.TaskHotkeys = _settings.QuickTaskHotkeys;
+        _notification.CustomTasks = _settings.CustomTasks;
+        _notification.FreeformHotkey = _settings.FreeformHotkey;
         _notification.Create(_hInstance);
         _notification.Clicked += () =>
             NativeMethods.PostMessageW(_hWnd, NativeMethods.WM_APP_SHOW, IntPtr.Zero, IntPtr.Zero);
@@ -225,6 +244,16 @@ internal sealed class MainWindow
             NativeMethods.PostMessageW(_hWnd, NativeMethods.WM_APP_AIEDIT, IntPtr.Zero, IntPtr.Zero);
         _notification.QuickTaskClicked += (taskIdx) =>
             NativeMethods.PostMessageW(_hWnd, NativeMethods.WM_APP_QUICKTASK, new IntPtr(taskIdx), IntPtr.Zero);
+        _notification.FreeformSubmitted += (instruction) =>
+        {
+            var text = _pendingFreeformText;
+            if (text == null && _monitor.Items.Count > 0)
+                text = _monitor.Items[0].Text;
+            // Don't overwrite _previousForegroundWindow — the hotkey handler already set it
+            _inlineAiFromNotification = true;
+            StartFreeformAiTask(text, instruction);
+            _pendingFreeformText = null;
+        };
         _notification.CancelRequested += () =>
         {
             if (_inlineAiFromNotification)
@@ -235,6 +264,10 @@ internal sealed class MainWindow
 
         // Measure pill row to set fixed window width
         MeasureWindowWidth();
+
+        // Ensure mcp.json and skills folder exist
+        EnsureMcpJson();
+        EnsureSkillsFolder();
 
         // Initialize Copilot SDK client and session
         InitCopilotAsync();
@@ -260,6 +293,7 @@ internal sealed class MainWindow
         RemoveMouseHook();
         NativeMethods.RemoveClipboardFormatListener(_hWnd);
         NativeMethods.UnregisterHotKey(_hWnd, HOTKEY_ID);
+        UnregisterTaskHotkeys();
         RemoveTrayIcon();
         // Dispose Copilot SDK
         _aiCancellation?.Cancel();
@@ -272,12 +306,21 @@ internal sealed class MainWindow
     {
         try
         {
+            var mcpServers = (_settings.McpEnabled) ? LoadMcpServers() : null;
+
             _copilotClient = new CopilotClient();
 
             _copilotSession = await _copilotClient.CreateSessionAsync(new SessionConfig
             {
+                SystemMessage = new SystemMessageConfig
+                {
+                    Mode = SystemMessageMode.Replace,
+                    Content = _settings.SystemMessage,
+                },                
                 OnPermissionRequest = PermissionHandler.ApproveAll,
-                Model = _editModels[_editModelIndex],
+                McpServers = mcpServers,
+                Model = _settings.Model,
+                SkillDirectories = _settings.SkillsEnabled ? [AppSettings.SkillsDir] : null,
             });
 
             // Load available models from the SDK (after session is ready)
@@ -290,33 +333,146 @@ internal sealed class MainWindow
 
             NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
         }
-        catch
-        {
-            // Copilot CLI not available — features will be disabled
-        }
+        catch { }
     }
 
     private async void RecreateCopilotSession()
     {
         try
         {
-            if (_copilotSession != null)
-                await _copilotSession.DisposeAsync();
-            if (_copilotClient != null)
+            await RecreateCopilotSessionAsync();
+        }
+        catch { }
+    }
+
+    private async Task RecreateCopilotSessionAsync()
+    {
+        if (_copilotSession != null)
+        {
+            try { await _copilotSession.DisposeAsync(); } catch { }
+        }
+        if (_copilotClient != null)
+        {
+            _copilotSession = await _copilotClient.CreateSessionAsync(new SessionConfig
             {
-                _copilotSession = await _copilotClient.CreateSessionAsync(new SessionConfig
+                SystemMessage = new SystemMessageConfig
                 {
-                    OnPermissionRequest = PermissionHandler.ApproveAll,
-                    Model = _editModels[_editModelIndex],
-                });
+                    Mode = SystemMessageMode.Replace,
+                    Content = _settings.SystemMessage,
+                },                
+                OnPermissionRequest = PermissionHandler.ApproveAll,
+                McpServers = (_settings.McpEnabled) ? LoadMcpServers() : null,
+                Model = _settings.Model,
+                SkillDirectories = _settings.SkillsEnabled ? [AppSettings.SkillsDir] : null,
+            });
+        }
+    }
+
+    private static void EnsureMcpJson()
+    {
+        try
+        {
+            Directory.CreateDirectory(AppSettings.SettingsDir);
+            if (!File.Exists(AppSettings.McpJsonFile))
+            {
+                File.WriteAllText(AppSettings.McpJsonFile, "{\n  \"servers\": {}\n}\n");
             }
         }
         catch { }
     }
 
+    private static void EnsureSkillsFolder()
+    {
+        try { Directory.CreateDirectory(AppSettings.SkillsDir); }
+        catch { }
+    }
+
+    private Dictionary<string, object>? LoadMcpServers()
+    {
+        if (!_settings.McpEnabled) return null;
+        try
+        {
+            if (!File.Exists(AppSettings.McpJsonFile)) return null;
+            var json = File.ReadAllText(AppSettings.McpJsonFile);
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("servers", out var servers)) return null;
+            var disabled = new HashSet<string>(_settings.DisabledMcpServers);
+            var result = new Dictionary<string, object>();
+            foreach (var prop in servers.EnumerateObject())
+            {
+                if (disabled.Contains(prop.Name)) continue;
+                var serverType = prop.Value.TryGetProperty("type", out var t) ? t.GetString() : null;
+                if (serverType is "stdio" or "local")
+                {
+                    var cfg = new McpLocalServerConfig
+                    {
+                        Type = "local",
+                        Command = prop.Value.TryGetProperty("command", out var cmd) ? cmd.GetString() ?? "" : "",
+                        Tools = new List<string> { "*" },
+                    };
+                    if (prop.Value.TryGetProperty("args", out var args))
+                        cfg.Args = args.EnumerateArray().Select(a => a.GetString() ?? "").ToList();
+                    if (prop.Value.TryGetProperty("env", out var env))
+                        cfg.Env = env.EnumerateObject().ToDictionary(e => e.Name, e => e.Value.GetString() ?? "");
+                    if (prop.Value.TryGetProperty("cwd", out var cwd))
+                        cfg.Cwd = cwd.GetString();
+                    if (prop.Value.TryGetProperty("timeout", out var timeout) && timeout.TryGetInt32(out var ms))
+                        cfg.Timeout = ms;
+                    result[prop.Name] = cfg;
+                }
+                else if (serverType is "http" or "sse")
+                {
+                    var cfg = new McpRemoteServerConfig
+                    {
+                        Type = serverType,
+                        Url = prop.Value.TryGetProperty("url", out var url) ? url.GetString() ?? "" : "",
+                        Tools = new List<string> { "*" },
+                    };
+                    if (prop.Value.TryGetProperty("headers", out var headers))
+                        cfg.Headers = headers.EnumerateObject().ToDictionary(e => e.Name, e => e.Value.GetString() ?? "");
+                    if (prop.Value.TryGetProperty("timeout", out var timeout) && timeout.TryGetInt32(out var ms))
+                        cfg.Timeout = ms;
+                    result[prop.Name] = cfg;
+                }
+            }
+            return result.Count > 0 ? result : null;
+        }
+        catch { return null; }
+    }
+
+    private async Task<CopilotSession> EnsureSessionAsync()
+    {
+        if (_copilotSession == null)
+        {
+            if (_copilotClient == null)
+            {
+                _copilotClient = new CopilotClient();
+            }
+            await RecreateCopilotSessionAsync();
+        }
+        return _copilotSession ?? throw new InvalidOperationException("Failed to create Copilot session");
+    }
+
+    private async Task<AssistantMessageEvent?> SendWithRetryAsync(MessageOptions options, CancellationToken ct)
+    {
+        var session = await EnsureSessionAsync();
+        try
+        {
+            return await session.SendAndWaitAsync(options, null, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch
+        {
+            // Session may have expired — recreate and retry once
+            await RecreateCopilotSessionAsync();
+            session = _copilotSession ?? throw new InvalidOperationException("Failed to recreate Copilot session");
+            return await session.SendAndWaitAsync(options, null, ct);
+        }
+    }
+
     private async void SendAiRequest()
     {
-        if (_copilotSession == null || _editItem == null || _aiProcessing)
+        if (_copilotClient == null || _editItem == null || _aiProcessing)
             return;
 
         _aiProcessing = true;
@@ -335,8 +491,8 @@ internal sealed class MainWindow
             for (int i = 0; i < _editChoices && !ct.IsCancellationRequested; i++)
             {
                 string prompt = ComposePrompt(inputText, i + 1);
-                var response = await _copilotSession.SendAndWaitAsync(
-                    new MessageOptions { Prompt = prompt }, null, ct);
+                var response = await SendWithRetryAsync(
+                    new MessageOptions { Prompt = prompt }, ct);
                 if (response?.Data?.Content is { } content && content.Length > 0)
                 {
                     _aiResults.Add(content);
@@ -369,7 +525,7 @@ internal sealed class MainWindow
 
     private async void StartInlineAiRequest(int itemIndex, int taskIndex)
     {
-        if (_copilotSession == null || _inlineAiProcessing)
+        if (_copilotClient == null || _inlineAiProcessing)
             return;
 
         // Always use history items (not bookmarks) — notification popup triggers use index 0 of history
@@ -393,9 +549,10 @@ internal sealed class MainWindow
         try
         {
             var ct = _inlineAiCancellation.Token;
-            string prompt = $"Task: {EditTasks[taskIndex]}.\n\nText to edit:\n\n{inputText}\n\nRespond ONLY with the edited text. No explanations, no markdown fences, no preamble.";
-            var response = await _copilotSession.SendAndWaitAsync(
-                new MessageOptions { Prompt = prompt }, null, ct);
+            string promptPrefix = GetTaskPromptPrefix(taskIndex);
+            string prompt = $"{promptPrefix} Input text: {inputText}";
+            var response = await SendWithRetryAsync(
+                new MessageOptions { Prompt = prompt }, ct);
             if (response?.Data?.Content is { } content && content.Length > 0 && !ct.IsCancellationRequested)
             {
                 _monitor.SetIgnoreNext();
@@ -428,12 +585,48 @@ internal sealed class MainWindow
         try { _copilotSession?.AbortAsync().GetAwaiter().GetResult(); } catch { }
     }
 
+    private void RebuildTaskArrays()
+    {
+        var customs = _settings.CustomTasks;
+        if (customs.Count == 0)
+        {
+            EditTasks = BuiltInEditTasks;
+            EditTaskIcons = BuiltInEditTaskIcons;
+            return;
+        }
+        var names = new string[BuiltInEditTasks.Length + customs.Count];
+        var icons = new string[names.Length];
+        Array.Copy(BuiltInEditTasks, names, BuiltInEditTasks.Length);
+        Array.Copy(BuiltInEditTaskIcons, icons, BuiltInEditTaskIcons.Length);
+        for (int i = 0; i < customs.Count; i++)
+        {
+            names[BuiltInEditTasks.Length + i] = customs[i].Name;
+            icons[BuiltInEditTasks.Length + i] = "\u26a1";
+        }
+        EditTasks = names;
+        EditTaskIcons = icons;
+    }
+
+    private string GetTaskPromptPrefix(int taskIndex)
+    {
+        int customBase = BuiltInEditTasks.Length;
+        if (taskIndex >= customBase)
+        {
+            int ci = taskIndex - customBase;
+            if (ci < _settings.CustomTasks.Count && !string.IsNullOrWhiteSpace(_settings.CustomTasks[ci].Prompt))
+                return _settings.CustomTasks[ci].Prompt;
+        }
+        if (taskIndex > 0 && taskIndex < EditTasks.Length)
+            return $"Task: {EditTasks[taskIndex]}.";
+        return "";
+    }
+
     private string ComposePrompt(string inputText, int choiceNumber)
     {
         var parts = new List<string>();
 
         if (_editTaskIndex > 0)
-            parts.Add($"Task: {EditTasks[_editTaskIndex]}.");
+            parts.Add(GetTaskPromptPrefix(_editTaskIndex));
         if (_editToneIndex > 0)
             parts.Add($"Tone: {EditTones[_editToneIndex]}.");
         if (_editFormatIndex > 0)
@@ -444,8 +637,7 @@ internal sealed class MainWindow
         if (_editChoices > 1)
             parts.Add($"This is variation {choiceNumber} of {_editChoices}. Make each variation meaningfully different.");
 
-        parts.Add($"Text to edit:\n\n{inputText}");
-        parts.Add("Respond ONLY with the edited text. No explanations, no markdown fences, no preamble.");
+        parts.Add($"Input text:\n\n{inputText}");
 
         return string.Join("\n", parts);
     }
@@ -551,25 +743,41 @@ internal sealed class MainWindow
                     short delta = (short)(hookStruct.mouseData >> 16);
                     if (_activeTab == 2)
                     {
-                        int step = Math.Max(8, Math.Abs(delta) / 3);
-                        // Check if mouse is over a result textbox
-                        int localX = hookStruct.pt.X - rc.Left;
-                        int localY = hookStruct.pt.Y - rc.Top;
-                        bool scrolledResult = false;
-                        for (int ri = 0; ri < _aiResultTextBoxRects.Length; ri++)
+                        // Model dropdown scrolling
+                        if (_editModelDropdownOpen)
                         {
-                            if (_aiResultTextBoxRects[ri].Contains(localX, localY) && ri < _aiResultScrollOffsets.Length)
+                            int dropItemH = 28;
+                            int maxVisible = Math.Min(_editModels.Length, 8);
+                            int totalH = _editModels.Length * dropItemH + 4;
+                            int visibleH = maxVisible * dropItemH + 4;
+                            if (totalH > visibleH)
                             {
-                                _aiResultScrollOffsets[ri] += delta < 0 ? step : -step;
-                                if (_aiResultScrollOffsets[ri] < 0) _aiResultScrollOffsets[ri] = 0;
-                                scrolledResult = true;
-                                break;
+                                _editModelScrollOffset = Math.Clamp(_editModelScrollOffset - delta / 4, 0, totalH - visibleH);
+                                NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
                             }
                         }
-                        if (!scrolledResult)
+                        else
                         {
-                            _editTextScrollOffset += delta < 0 ? step : -step;
-                            if (_editTextScrollOffset < 0) _editTextScrollOffset = 0;
+                            int step = Math.Max(8, Math.Abs(delta) / 3);
+                            // Check if mouse is over a result textbox
+                            int localX = hookStruct.pt.X - rc.Left;
+                            int localY = hookStruct.pt.Y - rc.Top;
+                            bool scrolledResult = false;
+                            for (int ri = 0; ri < _aiResultTextBoxRects.Length; ri++)
+                            {
+                                if (_aiResultTextBoxRects[ri].Contains(localX, localY) && ri < _aiResultScrollOffsets.Length)
+                                {
+                                    _aiResultScrollOffsets[ri] += delta < 0 ? step : -step;
+                                    if (_aiResultScrollOffsets[ri] < 0) _aiResultScrollOffsets[ri] = 0;
+                                    scrolledResult = true;
+                                    break;
+                                }
+                            }
+                            if (!scrolledResult)
+                            {
+                                _editTextScrollOffset += delta < 0 ? step : -step;
+                                if (_editTextScrollOffset < 0) _editTextScrollOffset = 0;
+                            }
                         }
                     }
                     else
@@ -703,6 +911,41 @@ internal sealed class MainWindow
                         _previousForegroundWindow = NativeMethods.GetForegroundWindow();
                     ToggleWindow();
                 }
+                else if (wParam.ToInt32() == HOTKEY_FREEFORM)
+                {
+                    _previousForegroundWindow = NativeMethods.GetForegroundWindow();
+                    // Copy selected text from the active window first
+                    _pendingFreeformHotkey = true;
+                    _clipboardSeqBeforeCopy = NativeMethods.GetClipboardSequenceNumber();
+                    ReleaseModifierKeys();
+                    SimulateCopy();
+                    NativeMethods.SetTimer(_hWnd, COPY_TIMER_ID, 100, IntPtr.Zero);
+                }
+                else if (wParam.ToInt32() == HOTKEY_BUBBLE)
+                {
+                    _previousForegroundWindow = NativeMethods.GetForegroundWindow();
+                    _pendingBubbleHotkey = true;
+                    _clipboardSeqBeforeCopy = NativeMethods.GetClipboardSequenceNumber();
+                    ReleaseModifierKeys();
+                    SimulateCopy();
+                    NativeMethods.SetTimer(_hWnd, COPY_TIMER_ID, 100, IntPtr.Zero);
+                }
+                else
+                {
+                    int taskHotkeyId = wParam.ToInt32() - HOTKEY_TASK_BASE;
+                    // Built-in: 0-9 → EditTasks[1-10], Custom: 10+ → EditTasks[11+]
+                    int taskIndex = taskHotkeyId < 10 ? taskHotkeyId + 1 : BuiltInEditTasks.Length + (taskHotkeyId - 10);
+                    if (taskHotkeyId >= 0 && taskIndex < EditTasks.Length && !_inlineAiProcessing)
+                    {
+                        _previousForegroundWindow = NativeMethods.GetForegroundWindow();
+                        _pendingHotkeyTaskIndex = taskIndex;
+                        // Copy selected text from the active window
+                        _clipboardSeqBeforeCopy = NativeMethods.GetClipboardSequenceNumber();
+                        ReleaseModifierKeys();
+                        SimulateCopy();
+                        NativeMethods.SetTimer(_hWnd, COPY_TIMER_ID, 100, IntPtr.Zero);
+                    }
+                }
                 return IntPtr.Zero;
 
             case NativeMethods.WM_MOUSEWHEEL:
@@ -791,6 +1034,10 @@ internal sealed class MainWindow
                 }
                 return IntPtr.Zero;
 
+            case NativeMethods.WM_APP_FREEFORM:
+                // Handled internally by NotificationPopup input mode
+                return IntPtr.Zero;
+
             case NativeMethods.WM_APP_EXTRACTPASTE:
                 if (_extractedText != null)
                 {
@@ -849,6 +1096,11 @@ internal sealed class MainWindow
                             NativeMethods.Shell_NotifyIconW(NativeMethods.NIM_MODIFY, ref _trayIconData);
                         }
                     }
+                }
+                else if ((nuint)wParam.ToInt64() == COPY_TIMER_ID)
+                {
+                    NativeMethods.KillTimer(hWnd, COPY_TIMER_ID);
+                    OnCopyTimerFired();
                 }
                 return IntPtr.Zero;
 
@@ -1953,6 +2205,7 @@ internal sealed class MainWindow
         if (_editModelDropdownOpen)
         {
             int dropItemH = 28;
+            int maxVisible = Math.Min(_editModels.Length, 8);
             // Measure widest model name to size the dropdown
             int maxTextW = 0;
             foreach (var m in _editModels)
@@ -1963,7 +2216,8 @@ internal sealed class MainWindow
             int dropW = Math.Max(_editModelDropdownRect.Width + 40, maxTextW + 24);
             int dropX = _editModelDropdownRect.X;
             int dropY = _editModelDropdownRect.Y + _editModelDropdownRect.Height + 2;
-            int dropH = _editModels.Length * dropItemH + 4;
+            int totalH = _editModels.Length * dropItemH + 4;
+            int dropH = maxVisible * dropItemH + 4;
 
             var dropRect = new Rectangle(dropX, dropY, dropW, dropH);
             using (var dropBgM = new SolidBrush(Color.FromArgb(42, 42, 42)))
@@ -1974,9 +2228,13 @@ internal sealed class MainWindow
                 g.DrawPath(dropBorderM, dropPathM);
             }
 
+            var oldClip = g.Clip;
+            g.SetClip(dropRect);
+
             for (int i = 0; i < _editModels.Length; i++)
             {
-                int iy = dropY + 2 + i * dropItemH;
+                int iy = dropY + 2 + i * dropItemH - _editModelScrollOffset;
+                if (iy + dropItemH < dropY || iy > dropY + dropH) continue;
                 bool isHover = _editHoverElement == 500 + i;
                 bool isSelected = i == _editModelIndex;
 
@@ -1990,6 +2248,19 @@ internal sealed class MainWindow
                 }
 
                 g.DrawString(_editModels[i], smallFont, i == _editModelIndex ? textBrush : dimBrush, dropX + 10, iy + 6);
+            }
+
+            g.Clip = oldClip;
+
+            // Scrollbar
+            if (totalH > dropH)
+            {
+                int sbX = dropX + dropW - 6;
+                int sbTrackH = dropH - 8;
+                int sbThumbH = Math.Max(20, sbTrackH * dropH / totalH);
+                int sbThumbY = dropY + 4 + (int)((float)_editModelScrollOffset / (totalH - dropH) * (sbTrackH - sbThumbH));
+                using var sbBrush = new SolidBrush(Color.FromArgb(80, 80, 80));
+                g.FillRectangle(sbBrush, sbX, sbThumbY, 4, sbThumbH);
             }
         }
     }
@@ -2464,10 +2735,11 @@ internal sealed class MainWindow
                 int dropW = Math.Max(_editModelDropdownRect.Width + 40, maxTextW2 + 24);
                 int dropX = _editModelDropdownRect.X;
                 int dropY = _editModelDropdownRect.Y + _editModelDropdownRect.Height + 2;
-                int dropH = _editModels.Length * dropItemH + 4;
+                int maxVisible = Math.Min(_editModels.Length, 8);
+                int dropH = maxVisible * dropItemH + 4;
                 if (mx >= dropX && mx < dropX + dropW && my >= dropY && my < dropY + dropH)
                 {
-                    int idx = (my - dropY - 2) / dropItemH;
+                    int idx = (my - dropY - 2 + _editModelScrollOffset) / dropItemH;
                     if (idx >= 0 && idx < _editModels.Length)
                         newEditHover = 500 + idx;
                 }
@@ -2905,7 +3177,7 @@ internal sealed class MainWindow
                     case 21: _editToneDropdownOpen = !_editToneDropdownOpen; _editTaskDropdownOpen = false; _editFormatDropdownOpen = false; _editLengthDropdownOpen = false; _editModelDropdownOpen = false; needsRepaint = true; break;
                     case 22: _editFormatDropdownOpen = !_editFormatDropdownOpen; _editTaskDropdownOpen = false; _editToneDropdownOpen = false; _editLengthDropdownOpen = false; _editModelDropdownOpen = false; needsRepaint = true; break;
                     case 23: _editLengthDropdownOpen = !_editLengthDropdownOpen; _editTaskDropdownOpen = false; _editToneDropdownOpen = false; _editFormatDropdownOpen = false; _editModelDropdownOpen = false; needsRepaint = true; break;
-                    case 33: _editModelDropdownOpen = !_editModelDropdownOpen; _editTaskDropdownOpen = false; _editToneDropdownOpen = false; _editFormatDropdownOpen = false; _editLengthDropdownOpen = false; needsRepaint = true; break;
+                    case 33: _editModelDropdownOpen = !_editModelDropdownOpen; _editModelScrollOffset = 0; _editTaskDropdownOpen = false; _editToneDropdownOpen = false; _editFormatDropdownOpen = false; _editLengthDropdownOpen = false; needsRepaint = true; break;
 
                     default:
                         if (_editTaskDropdownOpen || _editToneDropdownOpen || _editFormatDropdownOpen || _editLengthDropdownOpen || _editModelDropdownOpen) { _editTaskDropdownOpen = false; _editToneDropdownOpen = false; _editFormatDropdownOpen = false; _editLengthDropdownOpen = false; _editModelDropdownOpen = false; needsRepaint = true; }
@@ -3090,7 +3362,7 @@ internal sealed class MainWindow
 
     private async void ExtractTextFromImage(int itemIndex)
     {
-        if (_copilotSession == null || _inlineAiProcessing)
+        if (_copilotClient == null || _inlineAiProcessing)
             return;
 
         var items = ActiveItems;
@@ -3128,10 +3400,10 @@ internal sealed class MainWindow
                 base64 = Convert.ToBase64String(ms.ToArray());
             }
 
-            var response = await _copilotSession.SendAndWaitAsync(
+            var response = await SendWithRetryAsync(
                 new MessageOptions
                 {
-                    Prompt = "Extract all text from this image. Respond ONLY with the extracted text exactly as it appears. No explanations, no markdown fences, no preamble.",
+                    Prompt = "Extract all text from this image.",
                     Attachments = [new UserMessageDataAttachmentsItemBlob
                     {
                         Type = "blob",
@@ -3139,7 +3411,7 @@ internal sealed class MainWindow
                         MimeType = "image/png",
                         DisplayName = "clipboard-image.png"
                     }]
-                }, null, ct);
+                }, ct);
 
             if (response?.Data?.Content is { } content && content.Length > 0 && !ct.IsCancellationRequested)
                 extractedText = content;
@@ -3325,6 +3597,215 @@ internal sealed class MainWindow
         NativeMethods.SendInput(4, inputs, Marshal.SizeOf<NativeMethods.INPUT>());
     }
 
+    private static void SimulateCopy()
+    {
+        var inputs = new NativeMethods.INPUT[4];
+
+        inputs[0].type = NativeMethods.INPUT_KEYBOARD;
+        inputs[0].u.ki.wVk = NativeMethods.VK_CONTROL;
+
+        inputs[1].type = NativeMethods.INPUT_KEYBOARD;
+        inputs[1].u.ki.wVk = 0x43; // C
+
+        inputs[2].type = NativeMethods.INPUT_KEYBOARD;
+        inputs[2].u.ki.wVk = 0x43; // C
+        inputs[2].u.ki.dwFlags = NativeMethods.KEYEVENTF_KEYUP;
+
+        inputs[3].type = NativeMethods.INPUT_KEYBOARD;
+        inputs[3].u.ki.wVk = NativeMethods.VK_CONTROL;
+        inputs[3].u.ki.dwFlags = NativeMethods.KEYEVENTF_KEYUP;
+
+        NativeMethods.SendInput(4, inputs, Marshal.SizeOf<NativeMethods.INPUT>());
+    }
+
+    private void OnCopyTimerFired()
+    {
+        int taskIdx = _pendingHotkeyTaskIndex;
+        bool isFreeform = _pendingFreeformHotkey;
+        bool isBubble = _pendingBubbleHotkey;
+        _pendingHotkeyTaskIndex = -1;
+        _pendingFreeformHotkey = false;
+        _pendingBubbleHotkey = false;
+        if (taskIdx < 0 && !isFreeform && !isBubble) return;
+
+        // Check if clipboard actually changed (i.e. text was selected/copied)
+        if (NativeMethods.GetClipboardSequenceNumber() == _clipboardSeqBeforeCopy)
+        {
+            if (isBubble)
+            {
+                // No text copied — show bubble in Ask AI mode
+                var emptyItem = new ClipboardItem { Text = "", Timestamp = DateTime.Now };
+                _notification.Show(emptyItem);
+                _notification.EnterInputMode();
+            }
+            else if (isFreeform && _monitor.Items.Count > 0)
+            {
+                _pendingFreeformText = _monitor.Items[0].Text;
+                _notification.ShowInputMode();
+            }
+            return;
+        }
+
+        // Read the selected text from clipboard
+        string? selectedText = null;
+        if (NativeMethods.OpenClipboard(_hWnd))
+        {
+            try
+            {
+                var hData = NativeMethods.GetClipboardData(NativeMethods.CF_UNICODETEXT);
+                if (hData != IntPtr.Zero)
+                {
+                    var ptr = NativeMethods.GlobalLock(hData);
+                    if (ptr != IntPtr.Zero)
+                    {
+                        selectedText = Marshal.PtrToStringUni(ptr);
+                        NativeMethods.GlobalUnlock(hData);
+                    }
+                }
+            }
+            finally
+            {
+                NativeMethods.CloseClipboard();
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(selectedText))
+        {
+            if (isBubble)
+            {
+                var emptyItem = new ClipboardItem { Text = "", Timestamp = DateTime.Now };
+                _notification.Show(emptyItem);
+                _notification.EnterInputMode();
+            }
+            else if (isFreeform && _monitor.Items.Count > 0)
+            {
+                _pendingFreeformText = _monitor.Items[0].Text;
+                _notification.ShowInputMode();
+            }
+            return;
+        }
+
+        if (isBubble)
+        {
+            // Text was copied — show bubble normally (like Ctrl+C)
+            var item = new ClipboardItem { Text = selectedText };
+            _notification.Show(item);
+        }
+        else if (isFreeform)
+        {
+            _pendingFreeformText = selectedText;
+            var item = new ClipboardItem { Text = selectedText };
+            _notification.Show(item);
+            _notification.EnterInputMode();
+        }
+        else
+        {
+        // Show notification and run AI task
+        var item = new ClipboardItem { Text = selectedText };
+        _notification.Show(item);
+        _notification.StartProcessing();
+        _inlineAiFromNotification = true;
+        StartHotkeyAiTask(selectedText, taskIdx);
+        }
+    }
+
+    private async void StartHotkeyAiTask(string inputText, int taskIndex)
+    {
+        if (_copilotClient == null || _inlineAiProcessing)
+            return;
+
+        _inlineAiProcessing = true;
+        _inlineAiItemIndex = -1;
+        _aiAnimPhase = 0;
+        NativeMethods.SetTimer(_hWnd, ANIM_TIMER_ID, 30, IntPtr.Zero);
+        StartTrayAnimation();
+        _inlineAiCancellation = new CancellationTokenSource();
+
+        try
+        {
+            var ct = _inlineAiCancellation.Token;
+            string promptPrefix = GetTaskPromptPrefix(taskIndex);
+            string prompt = $"{promptPrefix} Input text: {inputText}";
+            var response = await SendWithRetryAsync(
+                new MessageOptions { Prompt = prompt }, ct);
+            if (response?.Data?.Content is { } content && content.Length > 0 && !ct.IsCancellationRequested)
+            {
+                _monitor.SetIgnoreNext();
+                SetClipboardText(content);
+                ForceForegroundWindow(_previousForegroundWindow);
+                SchedulePaste();
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch { }
+        finally
+        {
+            _inlineAiProcessing = false;
+            _inlineAiCancellation?.Dispose();
+            _inlineAiCancellation = null;
+            NativeMethods.KillTimer(_hWnd, ANIM_TIMER_ID);
+            StopTrayAnimation();
+            if (_inlineAiFromNotification)
+            {
+                _inlineAiFromNotification = false;
+                _notification.StopProcessing();
+            }
+            NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
+        }
+    }
+
+    private async void StartFreeformAiTask(string? inputText, string instruction)
+    {
+        if (_copilotClient == null || _inlineAiProcessing)
+            return;
+
+        // Capture target window now — after the async await it may be stale
+        var targetWindow = _previousForegroundWindow;
+
+        // Update notification preview with the instruction text
+        _notification.UpdatePreviewText(instruction);
+
+        _inlineAiProcessing = true;
+        _inlineAiItemIndex = -1;
+        _aiAnimPhase = 0;
+        NativeMethods.SetTimer(_hWnd, ANIM_TIMER_ID, 30, IntPtr.Zero);
+        StartTrayAnimation();
+        _inlineAiCancellation = new CancellationTokenSource();
+
+        try
+        {
+            var ct = _inlineAiCancellation.Token;
+            string prompt = string.IsNullOrEmpty(inputText)
+                ? $"{instruction}"
+                : $"{instruction}\n\nInput text: {inputText}";
+            var response = await SendWithRetryAsync(
+                new MessageOptions { Prompt = prompt }, ct);
+            if (response?.Data?.Content is { } content && content.Length > 0 && !ct.IsCancellationRequested)
+            {
+                _monitor.SetIgnoreNext();
+                SetClipboardText(content);
+                ForceForegroundWindow(targetWindow);
+                SchedulePaste();
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch { }
+        finally
+        {
+            _inlineAiProcessing = false;
+            _inlineAiCancellation?.Dispose();
+            _inlineAiCancellation = null;
+            NativeMethods.KillTimer(_hWnd, ANIM_TIMER_ID);
+            StopTrayAnimation();
+            if (_inlineAiFromNotification)
+            {
+                _inlineAiFromNotification = false;
+                _notification.StopProcessing();
+            }
+            NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
+        }
+    }
+
     private static void ForceForegroundWindow(IntPtr target)
     {
         if (target == IntPtr.Zero)
@@ -3354,7 +3835,8 @@ internal sealed class MainWindow
                 _activeTab = 0;
             NativeMethods.InvalidateRect(_hWnd, IntPtr.Zero, false);
         }
-        else if (_monitor.Items.Count > 0)
+
+        if (_monitor.Items.Count > 0 && _settings.ShowNotification)
         {
             _notification.Show(_monitor.Items[0]);
         }
@@ -3545,6 +4027,9 @@ internal sealed class MainWindow
         int msg = lParam.ToInt32();
         switch (msg)
         {
+            case NativeMethods.WM_LBUTTONUP:
+                ToggleWindow();
+                break;
             case NativeMethods.WM_LBUTTONDBLCLK:
                 ToggleWindow();
                 break;
@@ -3610,6 +4095,61 @@ internal sealed class MainWindow
     {
         var (mods, vk) = _settings.ParseHotkey();
         NativeMethods.RegisterHotKey(_hWnd, HOTKEY_ID, mods, vk);
+        RegisterTaskHotkeys();
+    }
+
+    private void RegisterTaskHotkeys()
+    {
+        // Built-in task hotkeys (IDs 100-109 → EditTasks 1-10)
+        for (int i = 0; i < _settings.QuickTaskHotkeys.Length && i < 10; i++)
+        {
+            NativeMethods.UnregisterHotKey(_hWnd, HOTKEY_TASK_BASE + i);
+            var hk = _settings.QuickTaskHotkeys[i];
+            if (!string.IsNullOrEmpty(hk))
+            {
+                var (mods, vk) = AppSettings.ParseHotkeyString(hk);
+                if (vk != 0)
+                    NativeMethods.RegisterHotKey(_hWnd, HOTKEY_TASK_BASE + i, mods, vk);
+            }
+        }
+        // Custom task hotkeys (IDs 110+ → EditTasks 11+)
+        for (int i = 0; i < _settings.CustomTasks.Count; i++)
+        {
+            NativeMethods.UnregisterHotKey(_hWnd, HOTKEY_TASK_BASE + 10 + i);
+            var hk = _settings.CustomTasks[i].Hotkey;
+            if (!string.IsNullOrEmpty(hk))
+            {
+                var (mods, vk) = AppSettings.ParseHotkeyString(hk);
+                if (vk != 0)
+                    NativeMethods.RegisterHotKey(_hWnd, HOTKEY_TASK_BASE + 10 + i, mods, vk);
+            }
+        }
+        // Freeform hotkey
+        NativeMethods.UnregisterHotKey(_hWnd, HOTKEY_FREEFORM);
+        if (!string.IsNullOrEmpty(_settings.FreeformHotkey))
+        {
+            var (mods, vk) = AppSettings.ParseHotkeyString(_settings.FreeformHotkey);
+            if (vk != 0)
+                NativeMethods.RegisterHotKey(_hWnd, HOTKEY_FREEFORM, mods, vk);
+        }
+        // Bubble hotkey
+        NativeMethods.UnregisterHotKey(_hWnd, HOTKEY_BUBBLE);
+        if (!string.IsNullOrEmpty(_settings.BubbleHotkey))
+        {
+            var (mods, vk) = AppSettings.ParseHotkeyString(_settings.BubbleHotkey);
+            if (vk != 0)
+                NativeMethods.RegisterHotKey(_hWnd, HOTKEY_BUBBLE, mods, vk);
+        }
+    }
+
+    private void UnregisterTaskHotkeys()
+    {
+        for (int i = 0; i < 10; i++)
+            NativeMethods.UnregisterHotKey(_hWnd, HOTKEY_TASK_BASE + i);
+        for (int i = 0; i < _settings.CustomTasks.Count; i++)
+            NativeMethods.UnregisterHotKey(_hWnd, HOTKEY_TASK_BASE + 10 + i);
+        NativeMethods.UnregisterHotKey(_hWnd, HOTKEY_FREEFORM);
+        NativeMethods.UnregisterHotKey(_hWnd, HOTKEY_BUBBLE);
     }
 
     private void ShowHotkeyDialog()
@@ -3630,8 +4170,13 @@ internal sealed class MainWindow
     private void ShowSettingsDialog()
     {
         var oldHotkey = _settings.Hotkey;
+        var oldMcpEnabled = _settings.McpEnabled;
+        var oldDisabledMcp = new HashSet<string>(_settings.DisabledMcpServers);
+        var oldSkillsEnabled = _settings.SkillsEnabled;
+        var oldModel = _settings.Model;
+        var oldSystemMessage = _settings.SystemMessage;
         var dialog = new SettingsDialog();
-        if (dialog.Show(_hWnd, _settings))
+        if (dialog.Show(_hWnd, _settings, _editModels, _editModelIndex))
         {
             // Apply notification duration
             _notification.DurationMs = _settings.NotificationDurationMs;
@@ -3644,6 +4189,27 @@ internal sealed class MainWindow
             {
                 NativeMethods.UnregisterHotKey(_hWnd, HOTKEY_ID);
                 RegisterConfiguredHotkey();
+            }
+
+            // Rebuild task arrays for custom tasks
+            RebuildTaskArrays();
+            _editTaskIndex = Math.Clamp(_editTaskIndex, 0, EditTasks.Length - 1);
+
+            // Re-register task hotkeys (always, since any may have changed)
+            RegisterTaskHotkeys();
+            _notification.TaskHotkeys = _settings.QuickTaskHotkeys;
+            _notification.CustomTasks = _settings.CustomTasks;
+            _notification.FreeformHotkey = _settings.FreeformHotkey;
+
+            // Recreate session if MCP toggle, server selection, skills toggle, or system message changed
+            if (_settings.McpEnabled != oldMcpEnabled || !oldDisabledMcp.SetEquals(_settings.DisabledMcpServers) || _settings.SkillsEnabled != oldSkillsEnabled || _settings.SystemMessage != oldSystemMessage)
+                RecreateCopilotSession();
+
+            // Sync model if changed in settings
+            if (_settings.Model != oldModel)
+            {
+                _editModelIndex = Math.Max(0, Array.IndexOf(_editModels, _settings.Model));
+                RecreateCopilotSession();
             }
         }
     }

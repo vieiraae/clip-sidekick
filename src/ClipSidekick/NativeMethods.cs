@@ -26,6 +26,7 @@ internal static partial class NativeMethods
     public const int WM_NCHITTEST = 0x0084;
     public const int WM_SETCURSOR = 0x0020;
     public const int WM_KEYDOWN = 0x0100;
+    public const int WM_CHAR = 0x0102;
     public const int WM_GETMINMAXINFO = 0x0024;
     public const int WM_MOUSEACTIVATE = 0x0021;
 
@@ -204,6 +205,10 @@ internal static partial class NativeMethods
     [LibraryImport("user32.dll", SetLastError = true)]
     public static partial ushort RegisterClassExW(ref WNDCLASSEX lpwcx);
 
+    [LibraryImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool UnregisterClassW(IntPtr lpClassName, IntPtr hInstance);
+
     [LibraryImport("user32.dll", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
     public static partial IntPtr CreateWindowExW(
         uint dwExStyle, string lpClassName, string lpWindowName, uint dwStyle,
@@ -277,6 +282,9 @@ internal static partial class NativeMethods
 
     [LibraryImport("user32.dll")]
     public static partial IntPtr GetClipboardData(uint uFormat);
+
+    [LibraryImport("user32.dll")]
+    public static partial uint GetClipboardSequenceNumber();
 
     [LibraryImport("user32.dll")]
     public static partial IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
@@ -510,6 +518,38 @@ internal static partial class NativeMethods
     [LibraryImport("user32.dll", SetLastError = true)]
     public static partial IntPtr SetWindowsHookExW(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
 
+    // Keyboard hook
+    public const int WH_KEYBOARD_LL = 13;
+
+    public delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KBDLLHOOKSTRUCT
+    {
+        public uint vkCode;
+        public uint scanCode;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    public static bool KBDLLHOOKSTRUCT_IsCtrl(KBDLLHOOKSTRUCT ks) =>
+        (GetAsyncKeyState(0x11) & 0x8000) != 0; // VK_CONTROL
+
+    [LibraryImport("user32.dll", SetLastError = true)]
+    public static partial IntPtr SetWindowsHookExW(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll")]
+    public static extern int ToUnicodeEx(uint wVirtKey, uint wScanCode, byte[] lpKeyState,
+        [Out, MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder pwszBuff, int cchBuff, uint wFlags, IntPtr dwhkl);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetKeyboardState(byte[] lpKeyState);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetKeyboardLayout(uint idThread);
+
     [LibraryImport("user32.dll")]
     public static partial IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -568,6 +608,7 @@ internal static partial class NativeMethods
     public const uint WM_APP_AIEDIT = WM_APP + 3;
     public const uint WM_APP_QUICKTASK = WM_APP + 4;
     public const uint WM_APP_EXTRACTPASTE = WM_APP + 5;
+    public const uint WM_APP_FREEFORM = WM_APP + 6;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct GUITHREADINFO

@@ -102,7 +102,11 @@ internal sealed class HotkeyDialog
             NativeMethods.DispatchMessageW(ref msg);
         }
 
+        if (!_done)
+            NativeMethods.PostQuitMessage(0);
+
         NativeMethods.DestroyWindow(_hWnd);
+        NativeMethods.UnregisterClassW(classNamePtr, hInstance);
         Marshal.FreeHGlobal(classNamePtr);
 
         return _result;
