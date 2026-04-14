@@ -550,7 +550,7 @@ internal sealed class MainWindow
         {
             var ct = _inlineAiCancellation.Token;
             string promptPrefix = GetTaskPromptPrefix(taskIndex);
-            string prompt = $"{promptPrefix} Input text: {inputText}";
+            string prompt = $"{promptPrefix}.\n\nInput text: {inputText}.\n\nRespond with the result only, no explanations.";
             var response = await SendWithRetryAsync(
                 new MessageOptions { Prompt = prompt }, ct);
             if (response?.Data?.Content is { } content && content.Length > 0 && !ct.IsCancellationRequested)
@@ -3403,7 +3403,7 @@ internal sealed class MainWindow
             var response = await SendWithRetryAsync(
                 new MessageOptions
                 {
-                    Prompt = "Extract all text from this image.",
+                    Prompt = "Extract all text from this image. Respond ONLY with the extracted text. No explanations, no markdown fences, no preamble.",
                     Attachments = [new UserMessageDataAttachmentsItemBlob
                     {
                         Type = "blob",
@@ -3725,7 +3725,7 @@ internal sealed class MainWindow
         {
             var ct = _inlineAiCancellation.Token;
             string promptPrefix = GetTaskPromptPrefix(taskIndex);
-            string prompt = $"{promptPrefix} Input text: {inputText}";
+            string prompt = $"{promptPrefix}.\n\nInput text: {inputText}.\n\nRespond with the result only, no explanations.";
             var response = await SendWithRetryAsync(
                 new MessageOptions { Prompt = prompt }, ct);
             if (response?.Data?.Content is { } content && content.Length > 0 && !ct.IsCancellationRequested)
@@ -3777,7 +3777,7 @@ internal sealed class MainWindow
             var ct = _inlineAiCancellation.Token;
             string prompt = string.IsNullOrEmpty(inputText)
                 ? $"{instruction}"
-                : $"{instruction}\n\nInput text: {inputText}";
+                : $"{instruction}\n\nInput text: {inputText}.\n\nRespond with the result only, no explanations.";
             var response = await SendWithRetryAsync(
                 new MessageOptions { Prompt = prompt }, ct);
             if (response?.Data?.Content is { } content && content.Length > 0 && !ct.IsCancellationRequested)
